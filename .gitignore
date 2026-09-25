@@ -1,0 +1,45 @@
+# 运行时配置，含 Token 等敏感凭证，首次运行自动生成，勿提交
+config.json
+client_config.json
+
+# 数据目录：登录态 / Cookie / 日志 / 截图产物
+data/
+artifacts/
+storage-state.json
+run.lock
+*.pkl
+
+# 服务器端运行日志
+server.out.log
+
+# 错误日志
+*.error.log
+startup_error.log
+embedded_error.log
+engine_error.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Playwright 浏览器
+.playwright-browsers/
+
+# 打包产物
+build/
+dist/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 仓库里带的是空 Token 的示例配置，这两份要留着
+!lin端/config.json
+!win端/config.json
+!win端/client_config.json
