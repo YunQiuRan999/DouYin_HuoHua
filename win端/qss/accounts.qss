@@ -1,0 +1,16 @@
+/* 账号管理页：浅紫顶部 3px 边条 */
+#accountsPage {
+    background: transparent;
+    border-top: 3px solid #c4b5fd;
+}
+#accountsPage QPushButton#primaryBtn {
+    background: #f5f3ff;
+    border-color: #ddd6fe;
+    color: #6d28d9;
+}
+#accountsPage QPushButton#primaryBtn:hover { background: #ede9fe; }
+#accountsTable {
+    border-top: none;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}

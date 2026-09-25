@@ -1,0 +1,11 @@
+/* 发送时间与文案页：浅蓝紫顶部 3px 边条 */
+#schedulePage {
+    background: transparent;
+    border-top: 3px solid #a5b4fc;
+}
+#schedulePage QPushButton#primaryBtn {
+    background: #eef2ff;
+    border-color: #c7d2fe;
+    color: #4338ca;
+}
+#schedulePage QPushButton#primaryBtn:hover { background: #e0e7ff; }

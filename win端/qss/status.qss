@@ -1,0 +1,10 @@
+/* 状态监控页：浅天蓝顶部 3px 边条 */
+#statusPage {
+    background: transparent;
+    border-top: 3px solid #7dd3fc;
+}
+#statusTable {
+    border-top: none;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
