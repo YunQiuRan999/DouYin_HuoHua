@@ -1,0 +1,23 @@
+# 运行时配置（含敏感凭证），勿提交；首次运行自动生成真实 token
+config.json
+
+# 数据目录（登录态 / Cookie / 日志 / 产物）
+data/
+artifacts/
+storage-state.json
+run.lock
+*.pkl
+server.out.log
+
+# 错误日志
+*.error.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 打包产物
+build/
+dist/
