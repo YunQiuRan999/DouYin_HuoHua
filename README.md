@@ -33,7 +33,7 @@ bash deploy.sh --src /root/lin端
 
 Windows 端解压 `抖音续火花_成品版_打开即用.zip`，双击 `DouyinFireConsole.exe`。
 
-成品包在 `发行包/` 里，因为体积超了网页上传的上限被切成 4 个分卷，下载后把它们放在同一个文件夹，跑 `合并分卷.bat`（Linux / macOS 用 `sh 合并分卷.sh`）拼回完整 zip。附带 `上传说明.txt` 里写了校验用的 sha256。
+成品包在 `发行包/` 里，因为体积超了网页上传的上限被切成 4 个分卷，下载后把它们放在同一个文件夹，跑 `合并分卷.bat`（Linux / macOS 用 `sh 合并分卷.sh`）拼回完整 zip。附带 `下载说明.txt` 里写了校验用的 sha256。
 
 ## 目录
 
