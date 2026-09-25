@@ -33,12 +33,15 @@ bash deploy.sh --src /root/lin端
 
 Windows 端解压 `抖音续火花_成品版_打开即用.zip`，双击 `DouyinFireConsole.exe`。
 
+成品包在 `发行包/` 里，因为体积超了网页上传的上限被切成 4 个分卷，下载后把它们放在同一个文件夹，跑 `合并分卷.bat`（Linux / macOS 用 `sh 合并分卷.sh`）拼回完整 zip。附带 `上传说明.txt` 里写了校验用的 sha256。
+
 ## 目录
 
 ```
 deploy.sh       服务器端一键部署脚本
 lin端/          服务器端源码，FastAPI + Playwright
 win端/          Windows 端，源码包是 PySide6 源码，成品包是打包好的 exe
+发行包/         成品包分卷、源码包、合并脚本，下载从这儿拿
 使用说明.txt     从零开始的操作步骤
 免责声明.txt     风险、责任和使用限制
 LICENSE         非商业许可协议，禁止商用
