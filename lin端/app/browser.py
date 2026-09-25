@@ -1,0 +1,472 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator
+from urllib.parse import urlsplit, urlunsplit
+
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+
+from app.config import ConfigError, parse_auth_json
+from app.models import Settings
+from app.selectors import (
+    DOUYIN_CHAT_URL,
+    LOGIN_MARKERS,
+    LOGIN_REQUIRED_MARKERS,
+    RISK_MARKERS,
+    SEARCH_INPUTS,
+)
+from app.stealth import STEALTH_SCRIPT
+
+
+LOGGER = logging.getLogger("douyin_sender")
+
+
+class AuthenticationError(RuntimeError):
+    pass
+
+
+class RiskControlError(RuntimeError):
+    pass
+
+
+class SearchBoxNotReadyError(RuntimeError):
+    """私信页已打开但搜索框未就绪；说明渲染慢，而非登录失效。"""
+
+
+# 私信页是 SPA，domcontentloaded 之后搜索框由 JS 异步挂载，冷启动时可能超过
+# 单轮等待窗口。这里做有限次数重试，并在需要时 reload，避免把慢渲染误判为认证失效。
+SEARCH_BOX_RETRIES = 3
+_SEARCH_RETRY_DELAY_MS = 1_500
+
+
+# Collects only safe, whitelisted attributes. It deliberately reads no
+# innerText / innerHTML / outerHTML / value, so page content, chat messages
+# and friend nicknames can never enter the public diagnostic output.
+_DOM_SNAPSHOT_JS = """() => {
+  const attrs = el => ({
+    tag: el.tagName.toLowerCase(),
+    type: el.getAttribute('type'),
+    placeholder: el.getAttribute('placeholder'),
+    role: el.getAttribute('role'),
+    aria_label: el.getAttribute('aria-label'),
+  });
+  return {
+    inputs: Array.from(document.querySelectorAll('input')).map(attrs),
+    textareas: Array.from(document.querySelectorAll('textarea')).map(attrs),
+    contenteditable_count: document.querySelectorAll('[contenteditable="true"]').length,
+    role_textbox_count: document.querySelectorAll('[role="textbox"]').length,
+  };
+}"""
+
+_SAFE_ELEMENT_KEYS = ("tag", "type", "placeholder", "role", "aria_label")
+
+
+@dataclass
+class BrowserSession:
+    page: Page
+    context: BrowserContext
+
+
+@asynccontextmanager
+async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
+    playwright: Playwright | None = None
+    browser: Browser | None = None
+    context: BrowserContext | None = None
+    try:
+        playwright = await async_playwright().start()
+        context_args = {"viewport": {"width": 1440, "height": 1000}, "locale": "zh-CN"}
+        storage_state: dict[str, Any] | None = None
+        if settings.storage_state:
+            state = parse_auth_json(settings.storage_state, "DOUYIN_STORAGE_STATE")
+            if not isinstance(state, dict):
+                raise ConfigError("DOUYIN_STORAGE_STATE 必须是 JSON 对象")
+            # 新版 Playwright 已从 launch_persistent_context() 移除 storage_state 参数
+            # （仅 new_context 保留），因此不再放进启动参数，统一在上下文启动后
+            # 手动应用（_apply_storage_state），保证两个启动路径各版本都兼容。
+            storage_state = state
+
+        if settings.profile_dir:
+            # 持久化用户目录：保留 localStorage/IndexedDB 等本地存储，
+            # 让每次任务在"同一个浏览器环境"中运行，避免"全新访客+固定登录态"的机器特征。
+            # 与 launch_browser 一致，按 Edge → Chrome → 内置 Chromium 的优先级尝试；
+            # 某档启动失败会清理 profile 残留锁，避免脏状态导致后续全部失败。
+            settings.profile_dir.mkdir(parents=True, exist_ok=True)
+            attempts = [
+                ("微软 Edge", {"channel": "msedge"}),
+                ("Google Chrome", {"channel": "chrome"}),
+                ("内置 Chromium", {}),
+            ]
+            last_error: Exception | None = None
+            for name, extra in attempts:
+                merged = dict(context_args)
+                merged.update(extra)
+                try:
+                    context = await asyncio.wait_for(
+                        playwright.chromium.launch_persistent_context(
+                            user_data_dir=str(settings.profile_dir),
+                            headless=settings.headless,
+                            executable_path=settings.browser_path or None,
+                            args=_browser_args(),
+                            **merged,
+                        ),
+                        timeout=30,
+                    )
+                    break
+                except asyncio.TimeoutError as exc:
+                    last_error = exc
+                    LOGGER.warning("持久化浏览器 %s 启动超时，重试", name)
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    LOGGER.warning("持久化浏览器 %s 启动失败: %s", name, exc)
+                    _purge_profile_lock(settings.profile_dir)
+            if context is None:
+                raise ConfigError(
+                    f"无法启动持久化浏览器（{last_error}）。请安装 Microsoft Edge 或 Google Chrome，"
+                    "或在账号设置中指定浏览器可执行文件路径（BROWSER_PATH）。"
+                )
+        else:
+            browser = await launch_browser(playwright, headless=settings.headless, browser_path=settings.browser_path)
+            context = await browser.new_context(**context_args)
+
+        if storage_state is not None:
+            await _apply_storage_state(context, storage_state)
+        await context.add_init_script(STEALTH_SCRIPT)  # 反自动化指纹，降低风控识别概率
+        if not settings.storage_state and settings.cookie:
+            cookies = parse_auth_json(settings.cookie, "DOUYIN_COOKIE")
+            if not isinstance(cookies, list):
+                raise ConfigError("DOUYIN_COOKIE 必须是 Cookie 数组")
+            await context.add_cookies(_normalize_cookies(cookies))
+
+        page = await context.new_page()
+        if settings.trace:
+            await context.tracing.start(screenshots=True, snapshots=True, sources=False)
+        yield BrowserSession(page=page, context=context)
+    finally:
+        if context:
+            await context.close()
+        if browser:
+            await browser.close()
+        if playwright:
+            await playwright.stop()
+
+
+async def _apply_storage_state(context: BrowserContext, state: dict[str, Any]) -> None:
+    """把 storage_state 手动应用到已启动的浏览器上下文。
+
+    新版 Playwright 从 launch_persistent_context() 移除了 storage_state 参数，
+    这里统一在上下文启动后恢复登录态（各版本均兼容）：
+    - cookies → context.add_cookies()；
+    - localStorage → add_init_script 按 location.origin 精确注入，避免污染其它站点。
+    """
+    cookies = state.get("cookies", [])
+    if isinstance(cookies, list) and cookies:
+        await context.add_cookies(_normalize_cookies(cookies))
+
+    origins = state.get("origins", [])
+    if isinstance(origins, list) and origins:
+        mapping: dict[str, dict[str, str]] = {}
+        for origin in origins:
+            if not isinstance(origin, dict):
+                continue
+            origin_url = origin.get("origin")
+            items = origin.get("localStorage", [])
+            if not isinstance(origin_url, str) or not isinstance(items, list):
+                continue
+            kv: dict[str, str] = {}
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("name"), str)
+                    and isinstance(item.get("value"), str)
+                ):
+                    kv[item["name"]] = item["value"]
+            if kv:
+                mapping[origin_url] = kv
+        if mapping:
+            script = (
+                "(() => { const data = " + json.dumps(mapping, ensure_ascii=False)
+                + "; const o = data[location.origin]; if (o) { "
+                + "for (const k in o) { try { localStorage.setItem(k, o[k]); } catch (e) {} } } })();"
+            )
+            await context.add_init_script(script)
+
+
+def _browser_args() -> list[str]:
+    """统一的浏览器启动参数（减负 + 反自动化 + root 沙箱兼容）。"""
+    args = [
+        "--disable-blink-features=AutomationControlled",  # 抹平自动化标记（配合 stealth）
+        "--disable-gpu",
+        "--disable-gpu-compositing",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-ipc-flooding-protection",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "--mute-audio",
+    ]
+    # 云服务器以 root 运行时，Chromium 沙箱无法初始化会启动即崩溃
+    # （错误特征：BrowserType.launch ... browser has been closed）；
+    # root 环境下禁用沙箱是 Playwright 官方推荐的服务器部署方式。
+    if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        args.append("--no-sandbox")
+        args.append("--disable-setuid-sandbox")
+    return args
+
+
+def _purge_profile_lock(profile_dir: Path) -> None:
+    """清除 Chromium 持久化目录的崩溃残留锁，避免下次启动被阻塞。
+
+    浏览器进程被强杀（kill -9 / 断电）时会在 user_data_dir 留下
+    SingletonLock/SingletonCookie/SingletonSocket；不清除会导致后续
+    launch_persistent_context 一直等待锁而超时失败。
+    """
+    try:
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            candidate = profile_dir / name
+            if candidate.is_file():
+                candidate.unlink()
+    except OSError:
+        pass
+
+
+async def launch_browser(playwright: Playwright, *, headless: bool, browser_path: str | None = None):
+    """按优先级启动浏览器：显式路径 → 系统 Edge → 系统 Chrome → 内置 Chromium。
+
+    打包为 exe 时通常不捆绑 Chromium，优先使用 Windows 自带的 Edge。
+    供扫码登录（login_flow）使用；任务运行优先走 open_douyin 的持久化 profile。
+
+    - 启动带超时保护（30 秒），偶发挂起不会让登录/任务卡死；
+    - 启动失败自动重试一次，降低"有概率不弹浏览器"的概率；
+    - 减负参数：禁用 GPU 合成与后台节流，减少登录/任务运行时的浏览器卡顿。
+    """
+    launch_args = {
+        "headless": headless,
+        "args": _browser_args(),
+    }
+    if browser_path:
+        launch_args["executable_path"] = browser_path
+    attempts = [
+        ("微软 Edge", {"channel": "msedge"}),
+        ("Google Chrome", {"channel": "chrome"}),
+        ("内置 Chromium", {}),
+    ]
+    last_error: Exception | None = None
+    for name, extra in attempts:
+        merged = dict(launch_args)
+        merged.update(extra)
+        for round_index in (1, 2):  # 每档尝试 2 次，共最多 6 次
+            try:
+                return await asyncio.wait_for(
+                    playwright.chromium.launch(**merged),
+                    timeout=30,
+                )
+            except asyncio.TimeoutError as exc:
+                last_error = exc
+                LOGGER.warning("浏览器 %s 启动超时（第 %d 次），重试", name, round_index)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                LOGGER.warning("浏览器 %s 启动失败（第 %d 次）: %s", name, round_index, exc)
+                break  # 通道缺失等确定性错误无需重试同档
+    raise ConfigError(
+        f"无法启动浏览器（{last_error}）。请安装 Microsoft Edge 或 Google Chrome，"
+        "或在账号设置中指定浏览器可执行文件路径（BROWSER_PATH）。"
+    )
+
+
+async def verify_login(page: Page, timeout_ms: int = 15_000) -> None:
+    if await _any_visible(page, RISK_MARKERS, timeout_ms=2_000):
+        raise RiskControlError("抖音要求进行安全验证，任务已停止")
+    if await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+        raise AuthenticationError("抖音登录状态已失效")
+    if not await _any_visible(page, LOGIN_MARKERS, timeout_ms=timeout_ms):
+        raise AuthenticationError("未检测到抖音私信页面，登录状态可能失效或页面结构已变化")
+
+
+async def open_private_messages(page: Page, timeout_ms: int = 15_000) -> None:
+    await page.goto(DOUYIN_CHAT_URL, wait_until="domcontentloaded", timeout=45_000)
+    # 1. Explicit risk-control page takes priority, independently of login state.
+    if await _any_visible(page, RISK_MARKERS, timeout_ms=2_000):
+        raise RiskControlError("抖音私信页面要求进行安全验证，任务已停止")
+    # 2. An explicit login page is the only signal that lets us attribute to
+    #    expired credentials. Marker absence does not imply the credentials are
+    #    valid, so search-box detection (steps 3/4) is kept separate.
+    if await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+        raise AuthenticationError("进入抖音私信页面后登录状态失效")
+
+    # 3. Detect the friend search box. The chat page is a SPA whose search box is
+    #    mounted asynchronously after domcontentloaded; a single detection round
+    #    occasionally misses it on a cold runner. Retry a few times, reloading the
+    #    page when the first round fails, before concluding anything.
+    for attempt in range(1, SEARCH_BOX_RETRIES + 1):
+        matched = await _first_visible_selector(page, SEARCH_INPUTS, timeout_ms)
+        if matched is not None:
+            LOGGER.info("检测到好友搜索框: selector=%s, 第 %d 次尝试", matched, attempt)
+            await page.wait_for_timeout(3_000)
+            return
+        # The search box is missing; a freshly shown login prompt may only have
+        # appeared during the wait, so re-check before deciding to retry.
+        if await _any_visible(page, RISK_MARKERS, timeout_ms=2_000):
+            raise RiskControlError("抖音私信页面要求进行安全验证，任务已停止")
+        if await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+            raise AuthenticationError("进入抖音私信页面后登录状态失效")
+        if attempt < SEARCH_BOX_RETRIES:
+            LOGGER.warning("未检测到好友搜索框，第 %d/%d 次尝试，准备重试", attempt, SEARCH_BOX_RETRIES)
+            if attempt == 1:
+                # Reload once: a fresh load usually mounts the SPA search box.
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=45_000)
+                except Exception:
+                    LOGGER.exception("reload 失败，改为重新访问私信页面")
+                    await page.goto(DOUYIN_CHAT_URL, wait_until="domcontentloaded", timeout=45_000)
+            else:
+                await page.wait_for_timeout(_SEARCH_RETRY_DELAY_MS)
+
+    # 4. Search box is still missing after all attempts: emit a safe structural
+    #    diagnostic and choose the exception type based on evidence. Only an
+    #    explicit login marker justifies AuthenticationError; a page that is
+    #    already on /chat merely failed to render the search box in time.
+    diagnostic = await _collect_safe_diagnostic(page, LOGIN_REQUIRED_MARKERS, RISK_MARKERS)
+    LOGGER.error("多次重试后仍未检测到好友搜索框，页面安全诊断:\n%s", diagnostic)
+    raise SearchBoxNotReadyError(f"私信页面已打开，但搜索框在 {SEARCH_BOX_RETRIES} 次重试后仍未就绪")
+
+
+async def save_trace(session: BrowserSession, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await session.context.tracing.stop(path=path)
+
+
+async def _any_visible(page: Page, selectors: tuple[str, ...], timeout_ms: int) -> bool:
+    per_selector = max(250, timeout_ms // max(1, len(selectors)))
+    for selector in selectors:
+        try:
+            await page.locator(selector).first.wait_for(state="visible", timeout=per_selector)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _first_visible_selector(
+    page: Page,
+    selectors: tuple[str, ...],
+    timeout_ms: int,
+) -> str | None:
+    """Return the first selector whose element becomes visible, or None.
+
+    Unlike ``_any_visible`` this also reports *which* selector matched, so the
+    diagnostic can distinguish a slow render from a structural change.
+    """
+    per_selector = max(250, timeout_ms // max(1, len(selectors)))
+    for selector in selectors:
+        try:
+            await page.locator(selector).first.wait_for(state="visible", timeout=per_selector)
+            return selector
+        except Exception:
+            continue
+    return None
+
+
+async def _collect_safe_diagnostic(
+    page: Page,
+    login_markers: tuple[str, ...],
+    risk_markers: tuple[str, ...],
+) -> str:
+    url = _safe_url(page.url)
+    try:
+        title = (await page.title()).strip()
+    except Exception:
+        title = ""
+
+    try:
+        snapshot = await page.evaluate(_DOM_SNAPSHOT_JS) or {}
+    except Exception:
+        snapshot = {}
+
+    inputs = [_safe_element(item) for item in snapshot.get("inputs", [])]
+    textareas = [_safe_element(item) for item in snapshot.get("textareas", [])]
+    login_marker = await _any_visible(page, login_markers, timeout_ms=1_000)
+    risk_marker = await _any_visible(page, risk_markers, timeout_ms=1_000)
+    private_marker = await _any_visible(page, LOGIN_MARKERS, timeout_ms=1_000)
+
+    parts = [
+        f"url={url}",
+        f"title={title}",
+        f"inputs={json.dumps(inputs, ensure_ascii=False)}",
+        f"textareas={json.dumps(textareas, ensure_ascii=False)}",
+        f"role_textbox_count={snapshot.get('role_textbox_count', 0)}",
+        f"contenteditable_count={snapshot.get('contenteditable_count', 0)}",
+        f"login_marker={str(login_marker).lower()}",
+        f"risk_marker={str(risk_marker).lower()}",
+        f"private_marker={str(private_marker).lower()}",
+    ]
+    return "\n".join(parts)
+
+
+def _safe_element(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    return {key: raw.get(key) for key in _SAFE_ELEMENT_KEYS}
+
+
+def _safe_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _normalize_cookies(cookies: list[Any]) -> list[dict[str, Any]]:
+    normalized = []
+    for index, cookie in enumerate(cookies):
+        if not isinstance(cookie, dict):
+            raise ConfigError(f"DOUYIN_COOKIE[{index}] 必须是对象")
+
+        name = cookie.get("name")
+        value = cookie.get("value")
+        domain = cookie.get("domain")
+        if name == "":
+            continue
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise ConfigError(f"DOUYIN_COOKIE[{index}] 缺少有效的 name 或 value")
+        if not isinstance(domain, str) or not domain:
+            raise ConfigError(f"DOUYIN_COOKIE[{index}] 缺少有效的 domain")
+
+        expires = cookie.get("expires", cookie.get("expirationDate", -1))
+        if cookie.get("session") is True:
+            expires = -1
+        if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+            expires = -1
+
+        normalized.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": cookie.get("path") if isinstance(cookie.get("path"), str) else "/",
+                "expires": expires,
+                "httpOnly": bool(cookie.get("httpOnly", False)),
+                "secure": bool(cookie.get("secure", False)),
+                "sameSite": _normalize_same_site(cookie.get("sameSite")),
+            }
+        )
+    if not normalized:
+        raise ConfigError("DOUYIN_COOKIE 没有有效 Cookie")
+    return normalized
+
+
+def _normalize_same_site(value: Any) -> str:
+    mapping = {
+        "strict": "Strict",
+        "lax": "Lax",
+        "none": "None",
+        "no_restriction": "None",
+    }
+    return mapping.get(str(value).lower(), "Lax")
