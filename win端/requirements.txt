@@ -1,0 +1,11 @@
+# Windows 端依赖。上界卡在下一个主版本，避免依赖升大版本后打包或运行突然不兼容。
+# 需要精确复现环境时执行：pip freeze > requirements.lock.txt
+PySide6>=6.7,<7
+fastapi>=0.115,<1.0
+uvicorn>=0.32,<1.0
+websockets>=13,<16
+requests>=2.32,<3
+playwright>=1.54,<2
+python-dotenv>=1.1,<2
+tzdata>=2025.2,<2027
+pydantic>=2.8,<3.0
